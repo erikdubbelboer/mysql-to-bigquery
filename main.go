@@ -40,7 +40,7 @@ func (h *handler) OnRow(e *canal.RowsEvent) error {
 	case canal.InsertAction:
 		h.insert(e)
 	case canal.DeleteAction:
-		//h.delete(e)
+		h.delete(e)
 	case canal.UpdateAction:
 		h.update(e)
 	default:
@@ -110,6 +110,34 @@ func (h *handler) update(e *canal.RowsEvent) {
 		}
 	} else {
 		print(".")
+	}
+}
+
+func (h *handler) delete(e *canal.RowsEvent) {
+	for i := 0; i < len(e.Rows); i++ {
+		where := make([]string, 0, len(e.Table.PKColumns))
+		parameters := make([]bigquery.QueryParameter, 0, len(e.Table.PKColumns))
+
+		for _, pkc := range e.Table.PKColumns {
+			column := e.Table.Columns[pkc]
+
+			where = append(where, column.Name+" = @"+column.Name)
+			parameters = append(parameters, bigquery.QueryParameter{
+				Name:  column.Name,
+				Value: bigqueryValue(column, e.Rows[i][pkc]),
+			})
+		}
+
+		q := h.client.Query("DELETE FROM " + e.Table.Name + " WHERE " + strings.Join(where, " AND "))
+		q.Parameters = parameters
+
+		if j, err := q.Run(context.Background()); err != nil {
+			panic(err)
+		} else if status, err := j.Wait(context.Background()); err != nil {
+			panic(err)
+		} else if err := status.Err(); err != nil {
+			panic(err)
+		}
 	}
 }
 
