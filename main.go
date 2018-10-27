@@ -26,8 +26,8 @@ func (r bigqueryRow) Save() (map[string]bigquery.Value, string, error) {
 }
 
 type handler struct {
-	client  *bigquery.Client
-	dataset string
+	client *bigquery.Client
+	config Config
 }
 
 func (h *handler) OnRotate(*replication.RotateEvent) error          { return nil }
@@ -73,11 +73,11 @@ func (h *handler) insert(e *canal.RowsEvent) {
 
 	ctx := context.Background()
 
-	u := h.client.Dataset(h.dataset).Table(e.Table.Name).Uploader()
+	u := h.client.Dataset(h.config.Dataset).Table(e.Table.Name).Uploader()
 	if err := u.Put(ctx, rows); err != nil {
 		panic(err)
 	} else {
-		print(",")
+		print("-")
 	}
 }
 
@@ -101,7 +101,7 @@ func (h *handler) update(e *canal.RowsEvent) {
 
 	ctx := context.Background()
 
-	u := h.client.Dataset(h.dataset).Table(e.Table.Name).Uploader()
+	u := h.client.Dataset(h.config.Dataset).Table(e.Table.Name).Uploader()
 	if err := u.Put(ctx, rows); err != nil {
 		if pme, ok := err.(bigquery.PutMultiError); ok {
 			panic(pme[0].Error())
@@ -129,6 +129,8 @@ func (h *handler) delete(e *canal.RowsEvent) {
 		}
 
 		q := h.client.Query("DELETE FROM " + e.Table.Name + " WHERE " + strings.Join(where, " AND "))
+		q.DefaultProjectID = h.config.Project
+		q.DefaultDatasetID = h.config.Dataset
 		q.Parameters = parameters
 
 		if j, err := q.Run(context.Background()); err != nil {
@@ -137,6 +139,8 @@ func (h *handler) delete(e *canal.RowsEvent) {
 			panic(err)
 		} else if err := status.Err(); err != nil {
 			panic(err)
+		} else {
+			print("|")
 		}
 	}
 }
@@ -247,8 +251,8 @@ func main() {
 	}
 
 	canal.SetEventHandler(&handler{
-		client:  bc,
-		dataset: config.Dataset,
+		client: bc,
+		config: config,
 	})
 
 	if err := canal.CheckBinlogRowImage("FULL"); err != nil {

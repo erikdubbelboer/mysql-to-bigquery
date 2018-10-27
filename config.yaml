@@ -3,6 +3,7 @@ user: root
 password: ${PASSWORD}
 serverid: 2000
 tables: 
+  - api.placements
   - api.domains
 project: magnetic-icon-88807
 dataset: atomx
