@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"io/ioutil"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -14,6 +16,8 @@ import (
 	"github.com/siddontang/go-mysql/replication"
 	"github.com/siddontang/go-mysql/schema"
 	"gopkg.in/yaml.v2"
+
+	_ "github.com/go-sql-driver/mysql"
 )
 
 type bigqueryRow struct {
@@ -25,9 +29,26 @@ func (r bigqueryRow) Save() (map[string]bigquery.Value, string, error) {
 	return r.row, r.insertID, nil
 }
 
+type valueScanner struct {
+	i interface{}
+}
+
+func (v *valueScanner) Scan(src interface{}) error {
+	switch tv := src.(type) {
+	case []byte:
+		c := make([]byte, len(tv))
+		copy(c, tv)
+		v.i = c
+	default:
+		v.i = src
+	}
+	return nil
+}
+
 type handler struct {
 	client *bigquery.Client
 	config Config
+	db     *sql.DB
 }
 
 func (h *handler) OnRotate(*replication.RotateEvent) error          { return nil }
@@ -36,13 +57,39 @@ func (h *handler) OnDDL(nextPos mysql.Position, queryEvent *replication.QueryEve
 	return nil
 }
 func (h *handler) OnRow(e *canal.RowsEvent) error {
+	var r Rule
+	found := false
+	for _, rule := range h.config.Rules {
+		if rule.tableRegexp.MatchString(e.Table.Name) {
+			r = rule
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		panic("OnRow not maching any rule")
+	}
+
 	switch e.Action {
 	case canal.InsertAction:
-		h.insert(e)
+		if r.Update.Action == "delete" {
+			h.delete(r.Update, e, 0, 1)
+		} else {
+			h.update(r.Update, e, 0, 1)
+		}
 	case canal.DeleteAction:
-		h.delete(e)
+		if r.Update.Action == "update" {
+			h.update(r.Update, e, 0, 1)
+		} else {
+			h.delete(r.Update, e, 0, 1)
+		}
 	case canal.UpdateAction:
-		h.update(e)
+		if r.Update.Action == "delete" {
+			h.delete(r.Update, e, 1, 2)
+		} else {
+			h.update(r.Update, e, 1, 2)
+		}
 	default:
 		panic("unknown action")
 	}
@@ -54,26 +101,80 @@ func (h *handler) OnGTID(mysql.GTIDSet) error             { return nil }
 func (h *handler) OnPosSynced(mysql.Position, bool) error { return nil }
 func (h *handler) String() string                         { return "handler" }
 
-func (h *handler) insert(e *canal.RowsEvent) {
+func (h *handler) update(a Action, e *canal.RowsEvent, offset, increment int) {
+	if a.Action == "none" {
+		return
+	}
+
 	rows := make([]interface{}, 0, len(e.Rows))
 
-	for i := 0; i < len(e.Rows); i++ {
-		row := bigqueryRow{
-			row:      make(map[string]bigquery.Value, len(e.Rows[i])),
-			insertID: strconv.FormatUint(uint64(e.Header.LogPos), 10),
-		}
+	if a.Query != "" {
+		for i := offset; i < len(e.Rows); i += increment {
+			row := bigqueryRow{
+				row:      make(map[string]bigquery.Value),
+				insertID: strconv.FormatUint(uint64(e.Header.LogPos), 10),
+			}
 
-		for j := 0; j < len(e.Rows[i]); j++ {
-			column := e.Table.Columns[j]
-			row.row[column.Name] = bigqueryValue(column, e.Rows[i][j])
-		}
+			args := make([]interface{}, 0, len(e.Rows[i]))
 
-		rows = append(rows, row)
+			for j := 0; j < len(e.Rows[i]); j++ {
+				column := e.Table.Columns[j]
+				args = append(args, sql.Named(column.Name, bigqueryValue(column, e.Rows[i][j])))
+			}
+
+			qr, err := h.db.Query(a.Query, args...)
+			if err != nil {
+				panic(err)
+			}
+
+			columns, err := qr.Columns()
+			if err != nil {
+				panic(err)
+			}
+
+			for qr.Next() {
+				values := make([]valueScanner, len(columns))
+				ifs := make([]interface{}, len(columns))
+
+				for k, v := range values {
+					ifs[k] = &v
+				}
+
+				if err := qr.Scan(ifs...); err != nil {
+					panic(err)
+				}
+
+				for j := 0; j < len(columns); j++ {
+					row.row[columns[j]] = values[j].i
+				}
+
+				rows = append(rows, row)
+			}
+		}
+	} else {
+		for i := offset; i < len(e.Rows); i += increment {
+			row := bigqueryRow{
+				row:      make(map[string]bigquery.Value, len(e.Rows[i])),
+				insertID: strconv.FormatUint(uint64(e.Header.LogPos), 10),
+			}
+
+			for j := 0; j < len(e.Rows[i]); j++ {
+				column := e.Table.Columns[j]
+				row.row[column.Name] = bigqueryValue(column, e.Rows[i][j])
+			}
+
+			rows = append(rows, row)
+		}
 	}
 
 	ctx := context.Background()
 
-	u := h.client.Dataset(h.config.Dataset).Table(e.Table.Name).Uploader()
+	table := a.Table
+	if table == "" {
+		table = e.Table.Name
+	}
+
+	u := h.client.Dataset(h.config.Dataset).Table(table).Uploader()
 	if err := u.Put(ctx, rows); err != nil {
 		panic(err)
 	} else {
@@ -81,40 +182,12 @@ func (h *handler) insert(e *canal.RowsEvent) {
 	}
 }
 
-func (h *handler) update(e *canal.RowsEvent) {
-	rows := make([]interface{}, 0, len(e.Rows))
-
-	// e.Rows[0] is the old value, e.Rows[1] is the new value.
-	for i := 0; i < len(e.Rows); i += 2 {
-		row := bigqueryRow{
-			row:      make(map[string]bigquery.Value, len(e.Rows[i+1])),
-			insertID: strconv.FormatUint(uint64(e.Header.LogPos), 10),
-		}
-
-		for j := 0; j < len(e.Rows[i+1]); j++ {
-			column := e.Table.Columns[j]
-			row.row[column.Name] = bigqueryValue(column, e.Rows[i+1][j])
-		}
-
-		rows = append(rows, row)
+func (h *handler) delete(a Action, e *canal.RowsEvent, offset, increment int) {
+	if a.Action == "none" {
+		return
 	}
 
-	ctx := context.Background()
-
-	u := h.client.Dataset(h.config.Dataset).Table(e.Table.Name).Uploader()
-	if err := u.Put(ctx, rows); err != nil {
-		if pme, ok := err.(bigquery.PutMultiError); ok {
-			panic(pme[0].Error())
-		} else {
-			panic(err)
-		}
-	} else {
-		print(".")
-	}
-}
-
-func (h *handler) delete(e *canal.RowsEvent) {
-	for i := 0; i < len(e.Rows); i++ {
+	for i := offset; i < len(e.Rows); i += increment {
 		where := make([]string, 0, len(e.Table.PKColumns))
 		parameters := make([]bigquery.QueryParameter, 0, len(e.Table.PKColumns))
 
@@ -201,14 +274,28 @@ func bigqueryValue(col schema.TableColumn, value interface{}) interface{} {
 	return value
 }
 
+type Action struct {
+	Action string `yaml:"action"`
+	Query  string `yaml:"query"`
+	Table  string `yaml:"table"`
+}
+
+type Rule struct {
+	Table  string `yaml:"table"`
+	Update Action `yaml:"update"`
+	Delete Action `yaml:"delete"`
+
+	tableRegexp *regexp.Regexp
+}
+
 type Config struct {
-	Addr     string   `yaml:"addr"`
-	User     string   `yaml:"user"`
-	Password string   `yaml:"password"`
-	ServerID uint32   `yaml:"serverid"`
-	Tables   []string `yaml:"tables"`
-	Project  string   `yaml:"project"`
-	Dataset  string   `yaml:"dataset"`
+	Addr     string `yaml:"addr"`
+	User     string `yaml:"user"`
+	Password string `yaml:"password"`
+	ServerID uint32 `yaml:"serverid"`
+	Project  string `yaml:"project"`
+	Dataset  string `yaml:"dataset"`
+	Rules    []Rule `yaml:"rules"`
 }
 
 func main() {
@@ -238,7 +325,17 @@ func main() {
 	cfg.ServerID = config.ServerID
 	cfg.Dump.DiscardErr = false
 
-	cfg.IncludeTableRegex = config.Tables
+	tables := make([]string, 0, len(config.Rules))
+	for _, rule := range config.Rules {
+		rule.tableRegexp, err = regexp.Compile(rule.Table)
+		if err != nil {
+			panic(err)
+		}
+
+		tables = append(tables, rule.Table)
+	}
+
+	cfg.IncludeTableRegex = tables
 
 	canal, err := canal.NewCanal(cfg)
 	if err != nil {
@@ -250,9 +347,15 @@ func main() {
 		panic(err)
 	}
 
+	db, err := sql.Open("mysql", config.User+":"+config.Password+"@tcp("+config.Addr+":3306)/")
+	if err != nil {
+		panic(err)
+	}
+
 	canal.SetEventHandler(&handler{
 		client: bc,
 		config: config,
+		db:     db,
 	})
 
 	if err := canal.CheckBinlogRowImage("FULL"); err != nil {

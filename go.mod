@@ -3,6 +3,7 @@ module github.com/erikdubbelboer/mysql-to-bigquery
 require (
 	cloud.google.com/go v0.31.0
 	github.com/BurntSushi/toml v0.3.1 // indirect
+	github.com/go-sql-driver/mysql v1.4.0
 	github.com/googleapis/gax-go v2.0.0+incompatible // indirect
 	github.com/juju/errors v0.0.0-20181012004132-a4583d0a56ea // indirect
 	github.com/satori/go.uuid v1.2.0 // indirect

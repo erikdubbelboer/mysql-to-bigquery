@@ -1,9 +1,40 @@
 addr: mysql-proxy-eu:3306
 user: root
-password: ${PASSWORD}
+password: ${PASSWORD} # From the environment
 serverid: 2000
-tables: 
-  - api.placements
-  - api.domains
+
+# bigquery project
 project: magnetic-icon-88807
+
+# bigquery dataset
 dataset: atomx
+
+rules:
+  - table: api.placements
+  - table: api.domains
+  - table: api.sites
+    update:
+      action: update
+      query: |
+        SELECT id, name, COUNT(*) AS sites
+        FROM api.publishers
+        WHERE id = @publisher_id
+      table: publishers
+    delete:
+      action: update
+      query: |
+        SELECT id, name, COUNT(*) AS sites
+        FROM api.publishers
+        LEFT JOIN api.sites ON sites.publisher_id = publishers.id
+        WHERE id = @publisher_id
+      table: publishers
+  - table: api.publishers
+    update:
+      action: update
+      query: |
+        SELECT id, name, COUNT(*) AS sites
+        FROM apipublishers
+        LEFT JOIN api.sites ON sites.publisher_id = publishers.id
+        WHERE id = @publisher_id
+    delete:
+      action: delete
